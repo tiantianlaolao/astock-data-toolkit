@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# 运行时数据 —— 本仓库只提供程序, 不提供数据
+astock_data/
+backfill_data/
+*.parquet
+*.db
+*.log
+*.csv
+*.pid
+*.bak*
+progress*.json
+errors*.json
+heartbeat.json
+master_status.json
+cninfo_orgid_map.json
+cninfo_refetch_progress.json
