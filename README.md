@@ -124,3 +124,13 @@ astock-data-toolkit/
 ## License
 
 [MIT](LICENSE)
+
+---
+
+## 关注公众号
+
+关注微信公众号「天怡数智」，获取更新与优惠信息：
+
+<img src="docs/qrcode_wechat.jpg" width="160" alt="公众号「天怡数智」二维码">
+
+（图片加载不出来？微信搜索"天怡数智"即可）
