@@ -28,10 +28,13 @@ INSERT OR IGNORE / 按股票整体 REPLACE, 只增不删, 随时可重跑。
   venv/bin/python info_weekly_update.py --sections ann --ann-start 2026-07-05 --ann-end 2026-07-08
   # 只抓不写, 验证完整性:
   venv/bin/python info_weekly_update.py --sections ann --ann-days 2026-04-29 --dry-run
+  # 补跑财务摘要(显式模式, 不动游标; 用于公告补完后重扫/救回失败股):
+  venv/bin/python info_weekly_update.py --sections fin --fin-since 2026-07-06
 """
 import argparse
 import datetime as dt
 import os
+import random
 import re
 import sqlite3
 import sys
@@ -51,6 +54,23 @@ DB_PATH = os.path.join(BASE, "astock_data", "info_archive.db")
 ANN_OVERLAP_DAYS = 3      # 公告窗口重叠, 防上轮收尾当天漏条
 HOLDER_OVERLAP_DAYS = 7   # sse/bse 日期窗口重叠(披露有延迟)
 FIN_DEFAULT_LOOKBACK = 14 # info_meta 无记录时财报驱动回看天数
+
+# ⚠️ fin 段(新浪 quotes.sina.cn JSON)防封节奏 —— 照搬 download_astock_data.py 中
+#   step4/step5 于 2026-04-20 事故(0.4s 节奏致 4699/5017 失败)后定下并实测零失败的方案。
+#   fin 原先裸奔 0.35~0.6s, 2026-08-08 夜在 ~98 只后触发 456 封 IP(err=50),
+#   且封禁持续 10h+ 呈间歇惩罚态 → 与 step4 同款 JSON 接口, 必须同款节奏。
+FIN_INTERVAL_MIN = 6.0
+FIN_INTERVAL_MAX = 9.0
+FIN_BATCH_PAUSE_EVERY = 50    # 每 50 只停 60s
+FIN_BATCH_PAUSE = 60
+FIN_LONG_PAUSE_EVERY = 200    # 每 200 只长歇 120~240s
+FIN_LONG_PAUSE_MIN = 120
+FIN_LONG_PAUSE_MAX = 240
+FIN_MAX_TRIES = 2             # 失败快弃(退避链 5 次共 200s 反而持续撞封禁)
+FIN_STOP_CONSECUTIVE = 10     # 连续失败熔断: 中止本段, 不推游标 → 下轮自动重试
+FIN_BAD_RATE_WINDOW = 30      # 滑窗失败率 >30% → 冷却 600s
+FIN_BAD_RATE_THRESHOLD = 0.30
+FIN_COOL_DOWN = 600
 SZSE_PAGE_CAP = 60        # szse 逐页翻安全上限(正常一周 ~15 页)
 
 # ⚠️⚠️ 巨潮全市场查询(不传 stock)有深翻页硬顶: 第 101 页起静默回吐第 1 页的内容 ——
@@ -312,33 +332,106 @@ def update_announcements(conn, days=None, start=None, end=None):
 
 # ---------- B. 财务摘要增量 (定期报告公告驱动) ----------
 
-def update_fin_abstract(conn):
-    last_ok = meta_get(conn, "fin_last_ok")
-    if last_ok:
-        since = (dt.date.fromisoformat(last_ok[:10]) - dt.timedelta(days=1)).isoformat()
-    else:
-        since = (dt.date.today() - dt.timedelta(days=FIN_DEFAULT_LOOKBACK)).isoformat()
+FIN_RESUME_FILE = os.path.join(BASE, "fin_resume_after.txt")
+
+
+def _fin_note_resume(codes, i, consecutive_fail, after):
+    """记录断点(最后一只成功股, 失败连串之前), 供 --fin-after 续跑。
+
+    i 为 1-based 当前进度; 若从头就全失败则回退到本轮入参 after(整轮重来)。
+    """
+    idx = i - consecutive_fail - 1
+    resume = codes[idx] if idx >= 0 else (after or "")
+    with open(FIN_RESUME_FILE, "w") as f:
+        f.write(resume + "\n")
+    print(f"[fin] 断点已记录: 续跑用 --fin-after {resume}", flush=True)
+    return resume
+
+
+def update_fin_abstract(conn, since=None, sleep_s=0.0, after="", limit=0):
+    """公告驱动: 重拉窗口内披露过定期报告/业绩预告的股票。
+
+    since 为人工补跑用(显式模式), 不读也不写游标 fin_last_ok —— 用于公告补完后
+    重扫漏掉的股票, 或救回某轮 err>0 但游标已推进的失败股。
+    sleep_s: 在内置 FIN_* 防封节奏之上追加的逐股延时(秒), 一般不需要。
+    after/limit 仅显式模式可用(CLI 层校验): after=断点续跑(跳过 code<=after),
+    limit=本轮最多处理 N 只后优雅停; 到量或熔断时都会把断点写进
+    fin_resume_after.txt, 下轮 --fin-after $(cat ...) 即可续。
+    两级熔断(连续失败中止 / 滑窗失败率冷却)在正常与手动模式均生效;
+    熔断中止时抛异常 → 不推游标, 下轮自动重试整个窗口。
+    """
+    manual = bool(since)
+    if not manual:
+        last_ok = meta_get(conn, "fin_last_ok")
+        if last_ok:
+            since = (dt.date.fromisoformat(last_ok[:10]) - dt.timedelta(days=1)).isoformat()
+        else:
+            since = (dt.date.today() - dt.timedelta(days=FIN_DEFAULT_LOOKBACK)).isoformat()
     codes = [r[0] for r in conn.execute(
         "SELECT DISTINCT code FROM announcements "
         "WHERE publish_time >= ? AND category IN ('定期报告','业绩预告') "
         "ORDER BY code", (since,))]
-    print(f"[fin] since {since}: {len(codes)} stocks with new reports", flush=True)
+    if after:
+        codes = [c for c in codes if c > after]
+    print(f"[fin] since {since}: {len(codes)} stocks with new reports"
+          f"{' (manual)' if manual else ''}"
+          f"{f' (after {after})' if after else ''}"
+          f"{f' (limit {limit})' if limit else ''}", flush=True)
 
     n_stocks, n_rows, n_err = 0, 0, 0
+    consecutive_fail = 0
+    recent = []               # 滑窗: 1=成功 0=失败
     t0 = time.time()
     for i, code in enumerate(codes, 1):
         try:
-            df = fin_mod.fetch_with_retry(code)
+            df = fin_mod.fetch_with_retry(code, max_tries=FIN_MAX_TRIES)
             if df is not None and not df.empty:
                 n_rows += fin_mod.save_stock(conn, code, df)
             n_stocks += 1
+            consecutive_fail = 0
+            recent.append(1)
         except Exception as e:
             n_err += 1
+            consecutive_fail += 1
+            recent.append(0)
             print(f"  [fin ERR] {code}: {type(e).__name__}: {e}", flush=True)
+        recent = recent[-FIN_BAD_RATE_WINDOW:]
+
+        # 熔断: 连续失败 → 中止本段(不推游标, 下轮重试), 别再撞封禁
+        if consecutive_fail >= FIN_STOP_CONSECUTIVE:
+            _fin_note_resume(codes, i, consecutive_fail, after)
+            raise RuntimeError(
+                f"连续 {FIN_STOP_CONSECUTIVE} 只失败, 疑似 456 封禁, 中止 fin "
+                f"(进度 {i}/{len(codes)}, 成功 {n_stocks})")
+        # 限量: 到量优雅停(只在显式模式传入), 断点写文件供下轮续跑
+        if limit and i >= limit:
+            _fin_note_resume(codes, i, consecutive_fail, after)
+            print(f"[fin] 到量停 (limit={limit}, 进度 {i}/{len(codes)}, "
+                  f"成功 {n_stocks})", flush=True)
+            break
+        # 冷却: 滑窗失败率过高 → 停 FIN_COOL_DOWN 再继续
+        if (len(recent) == FIN_BAD_RATE_WINDOW
+                and 1 - sum(recent) / FIN_BAD_RATE_WINDOW > FIN_BAD_RATE_THRESHOLD):
+            print(f"  ⚠ 最近 {FIN_BAD_RATE_WINDOW} 只失败率过阈, "
+                  f"冷却 {FIN_COOL_DOWN}s", flush=True)
+            time.sleep(FIN_COOL_DOWN)
+            recent = []
+
+        # 防封节奏(照搬 step4 实测方案)
+        if i % FIN_LONG_PAUSE_EVERY == 0:
+            lp = random.uniform(FIN_LONG_PAUSE_MIN, FIN_LONG_PAUSE_MAX)
+            print(f"  ... 长歇 {lp:.0f}s (每 {FIN_LONG_PAUSE_EVERY} 只)", flush=True)
+            time.sleep(lp)
+        elif i % FIN_BATCH_PAUSE_EVERY == 0:
+            print(f"  ... 批次停 {FIN_BATCH_PAUSE}s", flush=True)
+            time.sleep(FIN_BATCH_PAUSE)
+        else:
+            time.sleep(random.uniform(FIN_INTERVAL_MIN, FIN_INTERVAL_MAX) + sleep_s)
+
         if i % 100 == 0:
             rate = i / (time.time() - t0) * 3600
             print(f"  [fin {i}/{len(codes)}] rate={rate:.0f}/h", flush=True)
-    if n_err == 0 or n_stocks > 0:
+    if not manual and not DRY_RUN and (n_err == 0 or n_stocks > 0):
         meta_set(conn, "fin_last_ok", dt.date.today().isoformat())
     print(f"[fin] DONE stocks={n_stocks} rows_upserted={n_rows} err={n_err}", flush=True)
     return n_stocks, n_err
@@ -441,9 +534,20 @@ def main():
                     help="补历史: 逗号分隔的日期 2026-07-05,2026-07-06 (不动游标)")
     ap.add_argument("--ann-start", type=str, default="", help="补历史: 起始日 (不动游标)")
     ap.add_argument("--ann-end", type=str, default="", help="补历史: 结束日 (不动游标)")
+    ap.add_argument("--fin-since", type=str, default="",
+                    help="补跑 fin: 重拉该日起披露过定期报告/业绩预告的股票 (不动游标)")
+    ap.add_argument("--fin-after", type=str, default="",
+                    help="断点续跑: 跳过 code<=此值 (需与 --fin-since 同用)")
+    ap.add_argument("--fin-limit", type=int, default=0,
+                    help="本轮最多处理 N 只后优雅停 (需与 --fin-since 同用)")
+    ap.add_argument("--fin-sleep", type=float, default=0.0,
+                    help="fin 在内置防封节奏之上追加的逐股延时秒数(一般不需要)")
     ap.add_argument("--dry-run", action="store_true",
                     help="只抓不写库(事务最后回滚), 用于验证抓取完整性")
     args = ap.parse_args()
+    if (args.fin_after or args.fin_limit) and not args.fin_since:
+        ap.error("--fin-after/--fin-limit 仅限显式模式, 必须与 --fin-since 同用"
+                 " (正常模式游标语义不兼容断点/限量)")
     sections = {s.strip() for s in args.sections.split(",") if s.strip()}
     ann_days = [d for d in args.ann_days.split(",") if d.strip()]
 
@@ -468,7 +572,10 @@ def main():
 
     if "fin" in sections:
         try:
-            n_stocks, n_err = update_fin_abstract(conn)
+            n_stocks, n_err = update_fin_abstract(conn, since=args.fin_since or None,
+                                                  sleep_s=args.fin_sleep,
+                                                  after=args.fin_after,
+                                                  limit=args.fin_limit)
             stats.append(f"fin_stocks={n_stocks}(err={n_err})")
         except Exception as e:
             failed += 1
