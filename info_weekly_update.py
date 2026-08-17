@@ -16,6 +16,8 @@ INSERT OR IGNORE / 按股票整体 REPLACE, 只增不删, 随时可重跑。
   B. 财务摘要 fin_abstract — 公告驱动: 只重拉窗口内披露过
      定期报告/业绩预告(含业绩快报)的股票, 新浪接口一次返回该股全历史,
      整股 INSERT OR REPLACE(顺带覆盖财务重述)。窗口起点存 info_meta.fin_last_ok。
+     本轮失败的股票记进 info_meta.fin_retry 队列, 下轮自动并进窗口重试
+     (游标照常推进, 不靠扩窗口救), 连续 FIN_RETRY_MAX_ROUNDS 轮仍失败则放弃并告警。
   C. 增减持 holder_changes — sse/bse 用接口原生日期窗口参数;
      szse 无日期参数, 按最新在前从第 1 页翻, 整页全重复即停(row_key 去重),
      且失败只警告跳过(129 IP 曾被深交所掐, 不能炸整个周更)。
@@ -33,6 +35,7 @@ INSERT OR IGNORE / 按股票整体 REPLACE, 只增不删, 随时可重跑。
 """
 import argparse
 import datetime as dt
+import json
 import os
 import random
 import re
@@ -71,6 +74,12 @@ FIN_STOP_CONSECUTIVE = 10     # 连续失败熔断: 中止本段, 不推游标 �
 FIN_BAD_RATE_WINDOW = 30      # 滑窗失败率 >30% → 冷却 600s
 FIN_BAD_RATE_THRESHOLD = 0.30
 FIN_COOL_DOWN = 600
+# 失败股跟进重试(2026-08-17): 正常模式下 err>0 时游标照推(见 update_fin_abstract 收尾),
+#   失败股会掉出下轮窗口。原先只能靠人工 --fin-since 救(8-09 那 50 只即是), 现改为
+#   记进 info_meta.fin_retry 队列, 下轮并进窗口重试。之所以不改成"有失败就不推游标",
+#   是因为那样会让永久失败股(新浪根本没数据)把游标永远卡死, 且每轮重扫整窗口。
+FIN_RETRY_MAX_ROUNDS = 4      # 同一只连续 4 轮(约一个月)仍失败 → 出队并告警, 转人工
+FIN_RETRY_CAP = 300           # 队列硬上限, 防异常场景无限膨胀拖长周更
 SZSE_PAGE_CAP = 60        # szse 逐页翻安全上限(正常一周 ~15 页)
 
 # ⚠️⚠️ 巨潮全市场查询(不传 stock)有深翻页硬顶: 第 101 页起静默回吐第 1 页的内容 ——
@@ -348,6 +357,53 @@ def _fin_note_resume(codes, i, consecutive_fail, after):
     return resume
 
 
+def _fin_retry_load(conn):
+    """读失败重试队列 {code: 已连续失败轮数}。解析失败一律当空队列(不炸周更)。"""
+    raw = meta_get(conn, "fin_retry", "")
+    if not raw:
+        return {}
+    try:
+        return {str(k): int(v) for k, v in json.loads(raw).items()
+                if CODE_RE.match(str(k))}
+    except Exception as e:
+        print(f"[fin] ⚠ 重试队列解析失败, 按空队列处理: {type(e).__name__}: {e}",
+              flush=True)
+        return {}
+
+
+def _fin_retry_save(conn, old_map, attempted, failed_codes):
+    """本轮跑完后更新重试队列: 成功出队 / 失败计数+1 / 超轮次放弃告警。"""
+    failed = set(failed_codes)
+    new_map = dict(old_map)
+    for code in attempted:
+        if code not in failed:
+            new_map.pop(code, None)          # 这轮拿到了 → 出队
+    for code in failed:
+        new_map[code] = new_map.get(code, 0) + 1
+
+    giveup = sorted(c for c, n in new_map.items() if n >= FIN_RETRY_MAX_ROUNDS)
+    for code in giveup:
+        new_map.pop(code)
+    if giveup:
+        print(f"[fin] ⚠️ 连续 {FIN_RETRY_MAX_ROUNDS} 轮重试仍失败, 放弃跟进 "
+              f"{len(giveup)} 只 → 需人工排查(--fin-since): "
+              f"{','.join(giveup[:20])}{' ...' if len(giveup) > 20 else ''}",
+              flush=True)
+    if len(new_map) > FIN_RETRY_CAP:
+        dropped = sorted(new_map)[FIN_RETRY_CAP:]
+        for code in dropped:
+            new_map.pop(code)
+        print(f"[fin] ⚠️ 重试队列超上限 {FIN_RETRY_CAP}, 丢弃 {len(dropped)} 只",
+              flush=True)
+
+    meta_set(conn, "fin_retry", json.dumps(new_map, sort_keys=True))
+    if new_map:
+        preview = sorted(new_map)[:20]
+        print(f"[fin] 重试队列 {len(new_map)} 只留待下轮: "
+              f"{','.join(preview)}{' ...' if len(new_map) > 20 else ''}", flush=True)
+    return new_map
+
+
 def update_fin_abstract(conn, since=None, sleep_s=0.0, after="", limit=0):
     """公告驱动: 重拉窗口内披露过定期报告/业绩预告的股票。
 
@@ -358,9 +414,11 @@ def update_fin_abstract(conn, since=None, sleep_s=0.0, after="", limit=0):
     limit=本轮最多处理 N 只后优雅停; 到量或熔断时都会把断点写进
     fin_resume_after.txt, 下轮 --fin-after $(cat ...) 即可续。
     两级熔断(连续失败中止 / 滑窗失败率冷却)在正常与手动模式均生效;
-    熔断中止时抛异常 → 不推游标, 下轮自动重试整个窗口。
+    熔断中止时抛异常 → 不推游标、也不动重试队列, 下轮自动重试整个窗口。
+    正常模式还会把本轮失败股并进 info_meta.fin_retry, 下轮自动重试(显式模式不读不写)。
     """
     manual = bool(since)
+    normal = not manual and not DRY_RUN     # 只有正常模式维护游标与重试队列
     if not manual:
         last_ok = meta_get(conn, "fin_last_ok")
         if last_ok:
@@ -373,6 +431,12 @@ def update_fin_abstract(conn, since=None, sleep_s=0.0, after="", limit=0):
         "ORDER BY code", (since,))]
     if after:
         codes = [c for c in codes if c > after]
+    retry_map = _fin_retry_load(conn) if normal else {}
+    if retry_map:
+        n_window = len(codes)
+        codes = sorted(set(codes) | set(retry_map))     # 保持 code 升序(断点语义)
+        print(f"[fin] 并入上轮失败待重试 {len(retry_map)} 只 "
+              f"(窗口 {n_window} → 合计 {len(codes)})", flush=True)
     print(f"[fin] since {since}: {len(codes)} stocks with new reports"
           f"{' (manual)' if manual else ''}"
           f"{f' (after {after})' if after else ''}"
@@ -381,8 +445,10 @@ def update_fin_abstract(conn, since=None, sleep_s=0.0, after="", limit=0):
     n_stocks, n_rows, n_err = 0, 0, 0
     consecutive_fail = 0
     recent = []               # 滑窗: 1=成功 0=失败
+    attempted, failed_codes = [], []
     t0 = time.time()
     for i, code in enumerate(codes, 1):
+        attempted.append(code)
         try:
             df = fin_mod.fetch_with_retry(code, max_tries=FIN_MAX_TRIES)
             if df is not None and not df.empty:
@@ -394,6 +460,7 @@ def update_fin_abstract(conn, since=None, sleep_s=0.0, after="", limit=0):
             n_err += 1
             consecutive_fail += 1
             recent.append(0)
+            failed_codes.append(code)
             print(f"  [fin ERR] {code}: {type(e).__name__}: {e}", flush=True)
         recent = recent[-FIN_BAD_RATE_WINDOW:]
 
@@ -431,9 +498,15 @@ def update_fin_abstract(conn, since=None, sleep_s=0.0, after="", limit=0):
         if i % 100 == 0:
             rate = i / (time.time() - t0) * 3600
             print(f"  [fin {i}/{len(codes)}] rate={rate:.0f}/h", flush=True)
-    if not manual and not DRY_RUN and (n_err == 0 or n_stocks > 0):
+    n_retry = 0
+    if normal:
+        # 失败股进队列 → 下轮自动重试, 所以游标可以照常推进(不用扩窗口救)
+        n_retry = len(_fin_retry_save(conn, retry_map, attempted, failed_codes))
+    if normal and (n_stocks > 0 or n_err == 0):
+        # 唯一不推游标的情形: 一只都没成功且有失败 → 整窗下轮重来, 更保守
         meta_set(conn, "fin_last_ok", dt.date.today().isoformat())
-    print(f"[fin] DONE stocks={n_stocks} rows_upserted={n_rows} err={n_err}", flush=True)
+    print(f"[fin] DONE stocks={n_stocks} rows_upserted={n_rows} err={n_err}"
+          f"{f' retry_queue={n_retry}' if normal else ''}", flush=True)
     return n_stocks, n_err
 
 
