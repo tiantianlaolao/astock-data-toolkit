@@ -80,6 +80,17 @@ FIN_COOL_DOWN = 600
 #   是因为那样会让永久失败股(新浪根本没数据)把游标永远卡死, 且每轮重扫整窗口。
 FIN_RETRY_MAX_ROUNDS = 4      # 同一只连续 4 轮(约一个月)仍失败 → 出队并告警, 转人工
 FIN_RETRY_CAP = 300           # 队列硬上限, 防异常场景无限膨胀拖长周更
+# 跨轮续跑(2026-08-23): 中报季窗口量远超新浪单日配额, 旧逻辑"熔断→整窗下轮重来"
+#   在 窗口量 > 配额 时数学上永不收敛 —— 跑不完→游标不推→下轮窗口更大→更跑不完,
+#   fin_last_ok 会永久卡死(8-22 那轮即此: 窗口 1266 只, 熔断于 144, 游标停在 8-16)。
+#   改为: 冻结窗口(fin_window_end) + 断点持久化(fin_resume_code), 单轮抓够 FIN_RUN_CAP
+#   即优雅停并保留断点, 整窗跑完才推游标。配合日更 cron 分多天吃掉洪峰。
+#   ⚠️ 配额实测(两个独立数据点): 8-10 单轮 829 只后被封; 8-23 拆成 500+294 两轮
+#   (中间隔 2h)共 794 只后同样被封 —— 说明限流按滚动时间窗算, **同日拆批不重置配额**,
+#   所以只能靠"一天一轮"拉开间隔, 不能靠一天多跑几批。600 = 在 790~840 上留 25% 余量。
+#   ⚠️ 不做"探测到 200 就开跑"的自动重试: 封禁是间歇惩罚态, 探测通过是假信号
+#   (8-09 实证: 探到 200 即开跑, 51min 仅推进 ~90 只 err=14)。老实靠 24h 间隔。
+FIN_RUN_CAP = 600
 SZSE_PAGE_CAP = 60        # szse 逐页翻安全上限(正常一周 ~15 页)
 
 # ⚠️⚠️ 巨潮全市场查询(不传 stock)有深翻页硬顶: 第 101 页起静默回吐第 1 页的内容 ——
@@ -344,16 +355,21 @@ def update_announcements(conn, days=None, start=None, end=None):
 FIN_RESUME_FILE = os.path.join(BASE, "fin_resume_after.txt")
 
 
-def _fin_note_resume(codes, i, consecutive_fail, after):
-    """记录断点(最后一只成功股, 失败连串之前), 供 --fin-after 续跑。
+def _fin_note_resume(codes, i, consecutive_fail, after, conn=None, persist=False):
+    """记录断点(最后一只成功股, 失败连串之前), 供续跑。
 
     i 为 1-based 当前进度; 若从头就全失败则回退到本轮入参 after(整轮重来)。
+    persist=True(正常模式) 时同时写 info_meta.fin_resume_code, 下轮自动续跑;
+    文件 fin_resume_after.txt 始终写, 供人工 --fin-after 使用。
     """
     idx = i - consecutive_fail - 1
     resume = codes[idx] if idx >= 0 else (after or "")
     with open(FIN_RESUME_FILE, "w") as f:
         f.write(resume + "\n")
-    print(f"[fin] 断点已记录: 续跑用 --fin-after {resume}", flush=True)
+    if persist and conn is not None:
+        meta_set(conn, "fin_resume_code", resume)
+    print(f"[fin] 断点已记录: {'下轮自动续跑' if persist else ''}"
+          f"(人工续跑用 --fin-after {resume})", flush=True)
     return resume
 
 
@@ -404,48 +420,88 @@ def _fin_retry_save(conn, old_map, attempted, failed_codes):
     return new_map
 
 
-def update_fin_abstract(conn, since=None, sleep_s=0.0, after="", limit=0):
+def update_fin_abstract(conn, since=None, sleep_s=0.0, after="", limit=0,
+                        catchup_only=False):
     """公告驱动: 重拉窗口内披露过定期报告/业绩预告的股票。
 
-    since 为人工补跑用(显式模式), 不读也不写游标 fin_last_ok —— 用于公告补完后
-    重扫漏掉的股票, 或救回某轮 err>0 但游标已推进的失败股。
+    since 为人工补跑用(显式模式), 不读也不写游标 fin_last_ok/窗口/断点 —— 用于公告
+    补完后重扫漏掉的股票, 或救回某轮 err>0 但游标已推进的失败股。
     sleep_s: 在内置 FIN_* 防封节奏之上追加的逐股延时(秒), 一般不需要。
     after/limit 仅显式模式可用(CLI 层校验): after=断点续跑(跳过 code<=after),
     limit=本轮最多处理 N 只后优雅停; 到量或熔断时都会把断点写进
     fin_resume_after.txt, 下轮 --fin-after $(cat ...) 即可续。
+
+    正常模式(2026-08-23 起)支持跨轮续跑, 三个 info_meta 键协同:
+      fin_last_ok     已完整跑完的窗口截止日 —— 只有整窗跑完才推进
+      fin_window_end  冻结的窗口截止日; 非空 = 有欠账没跑完, 空 = 无欠账
+      fin_resume_code 断点 code; 续跑时只取 code > 它的部分
+    ⚠️ 窗口必须冻结: 断点是"跳过 code<=X"语义, 若续跑期间新公告带进一只 code 更小的
+    股, 它会被永久跳过(等整窗跑完游标一推, 它的公告日就掉出下个窗口了)。冻结后
+    窗口内容确定、code 升序确定, 断点才是精确的。
+    catchup_only=True(日更续跑用): 无欠账窗口时直接返回, 不开新窗口、零请求。
+
     两级熔断(连续失败中止 / 滑窗失败率冷却)在正常与手动模式均生效;
-    熔断中止时抛异常 → 不推游标、也不动重试队列, 下轮自动重试整个窗口。
+    熔断中止时抛异常 → 不推游标、也不动重试队列(但断点已落库, 下轮自动从断点续)。
     正常模式还会把本轮失败股并进 info_meta.fin_retry, 下轮自动重试(显式模式不读不写)。
     """
     manual = bool(since)
-    normal = not manual and not DRY_RUN     # 只有正常模式维护游标与重试队列
+    normal = not manual and not DRY_RUN     # 只有正常模式维护游标/窗口/断点/重试队列
+    window_end = ""
     if not manual:
+        window_end = meta_get(conn, "fin_window_end", "") if normal else ""
+        if catchup_only and not window_end:
+            print("[fin] 无欠账窗口, 日更续跑跳过(零请求)", flush=True)
+            return 0, 0
+        if not window_end:
+            window_end = dt.date.today().isoformat()    # 开新窗口
+        if normal:
+            # ⚠️ 必须在**开跑前**就把窗口冻结落库: 熔断走 raise 直接跳出函数, 到不了
+            #    收尾那段。若等收尾再写, 熔断后就只剩断点没有窗口, 日更会判成"无欠账"
+            #    而跳过 → 断点永远没人消费, 整套续跑在最该生效的场景下失效。
+            meta_set(conn, "fin_window_end", window_end)
+            after = meta_get(conn, "fin_resume_code", "") or after
         last_ok = meta_get(conn, "fin_last_ok")
         if last_ok:
             since = (dt.date.fromisoformat(last_ok[:10]) - dt.timedelta(days=1)).isoformat()
         else:
             since = (dt.date.today() - dt.timedelta(days=FIN_DEFAULT_LOOKBACK)).isoformat()
-    codes = [r[0] for r in conn.execute(
-        "SELECT DISTINCT code FROM announcements "
-        "WHERE publish_time >= ? AND category IN ('定期报告','业绩预告') "
-        "ORDER BY code", (since,))]
-    if after:
-        codes = [c for c in codes if c > after]
+    if window_end:
+        upper = (dt.date.fromisoformat(window_end)
+                 + dt.timedelta(days=1)).isoformat()    # publish_time 含时分 → 取次日零点
+        codes = [r[0] for r in conn.execute(
+            "SELECT DISTINCT code FROM announcements "
+            "WHERE publish_time >= ? AND publish_time < ? "
+            "AND category IN ('定期报告','业绩预告') "
+            "ORDER BY code", (since, upper))]
+    else:
+        codes = [r[0] for r in conn.execute(
+            "SELECT DISTINCT code FROM announcements "
+            "WHERE publish_time >= ? AND category IN ('定期报告','业绩预告') "
+            "ORDER BY code", (since,))]
     retry_map = _fin_retry_load(conn) if normal else {}
     if retry_map:
         n_window = len(codes)
         codes = sorted(set(codes) | set(retry_map))     # 保持 code 升序(断点语义)
         print(f"[fin] 并入上轮失败待重试 {len(retry_map)} 只 "
               f"(窗口 {n_window} → 合计 {len(codes)})", flush=True)
+    n_total = len(codes)
+    if after:
+        # ⚠️ 必须在并入重试队列之后过滤, 否则 code<=断点 的重试股会在每个续跑轮
+        #    被重复抓一遍, 且破坏"codes 全部 > 断点"这个断点数学前提
+        codes = [c for c in codes if c > after]
+    run_cap = limit if manual else FIN_RUN_CAP      # dry-run 同样受限, 别裸打接口
     print(f"[fin] since {since}: {len(codes)} stocks with new reports"
           f"{' (manual)' if manual else ''}"
+          f"{f' (window<={window_end})' if window_end else ''}"
           f"{f' (after {after})' if after else ''}"
-          f"{f' (limit {limit})' if limit else ''}", flush=True)
+          f"{f' (已完成 {n_total - len(codes)}/{n_total})' if after and not manual else ''}"
+          f"{f' (cap {run_cap})' if run_cap else ''}", flush=True)
 
     n_stocks, n_rows, n_err = 0, 0, 0
     consecutive_fail = 0
     recent = []               # 滑窗: 1=成功 0=失败
     attempted, failed_codes = [], []
+    completed = True          # 整窗跑完? 到量停会置 False; 熔断走抛异常不到收尾
     t0 = time.time()
     for i, code in enumerate(codes, 1):
         attempted.append(code)
@@ -464,16 +520,20 @@ def update_fin_abstract(conn, since=None, sleep_s=0.0, after="", limit=0):
             print(f"  [fin ERR] {code}: {type(e).__name__}: {e}", flush=True)
         recent = recent[-FIN_BAD_RATE_WINDOW:]
 
-        # 熔断: 连续失败 → 中止本段(不推游标, 下轮重试), 别再撞封禁
+        # 熔断: 连续失败 → 中止本段(不推游标, 下轮从断点续), 别再撞封禁。
+        # ⚠️ 仍然 raise: 断点虽已落库能自动续, 但 Step 6 FAILED 这个告警不能吞掉
         if consecutive_fail >= FIN_STOP_CONSECUTIVE:
-            _fin_note_resume(codes, i, consecutive_fail, after)
+            _fin_note_resume(codes, i, consecutive_fail, after, conn, normal)
             raise RuntimeError(
                 f"连续 {FIN_STOP_CONSECUTIVE} 只失败, 疑似 456 封禁, 中止 fin "
                 f"(进度 {i}/{len(codes)}, 成功 {n_stocks})")
-        # 限量: 到量优雅停(只在显式模式传入), 断点写文件供下轮续跑
-        if limit and i >= limit:
-            _fin_note_resume(codes, i, consecutive_fail, after)
-            print(f"[fin] 到量停 (limit={limit}, 进度 {i}/{len(codes)}, "
+        # 限量: 到量优雅停, 断点落库(正常模式)/落文件供下轮续跑。
+        # ⚠️ i < len(codes) 不能省: cap 恰好等于剩余只数时, 最后一只处理完也会满足
+        #    i >= run_cap, 那样会把"其实已经跑完"误标成未完成, 白等一轮才收窗口
+        if run_cap and i >= run_cap and i < len(codes):
+            _fin_note_resume(codes, i, consecutive_fail, after, conn, normal)
+            completed = False
+            print(f"[fin] 到量停 (cap={run_cap}, 进度 {i}/{len(codes)}, "
                   f"成功 {n_stocks})", flush=True)
             break
         # 冷却: 滑窗失败率过高 → 停 FIN_COOL_DOWN 再继续
@@ -499,14 +559,27 @@ def update_fin_abstract(conn, since=None, sleep_s=0.0, after="", limit=0):
             rate = i / (time.time() - t0) * 3600
             print(f"  [fin {i}/{len(codes)}] rate={rate:.0f}/h", flush=True)
     n_retry = 0
+    # 整窗跑完 且 不是"一只没成过还有失败"(那种情形整窗重来更保守)
+    window_done = completed and (n_stocks > 0 or n_err == 0)
     if normal:
         # 失败股进队列 → 下轮自动重试, 所以游标可以照常推进(不用扩窗口救)
         n_retry = len(_fin_retry_save(conn, retry_map, attempted, failed_codes))
-    if normal and (n_stocks > 0 or n_err == 0):
-        # 唯一不推游标的情形: 一只都没成功且有失败 → 整窗下轮重来, 更保守
-        meta_set(conn, "fin_last_ok", dt.date.today().isoformat())
+        if window_done:
+            # ⚠️ 推到 window_end 而不是 today: 窗口是冻结的, 冻结日之后的公告本轮
+            #    根本没查过, 推到 today 会把它们直接跳掉
+            meta_set(conn, "fin_last_ok", window_end)
+            meta_set(conn, "fin_window_end", "")      # 清欠账 → 日更下次空转
+            meta_set(conn, "fin_resume_code", "")
+        else:
+            meta_set(conn, "fin_window_end", window_end)   # 保持冻结, 下轮续
+            if completed:
+                meta_set(conn, "fin_resume_code", "")      # 整窗跑过但全失败 → 从头
+    tail = ""
+    if normal:
+        tail = (f" 窗口完成→游标推至 {window_end}" if window_done
+                else f" 窗口未完成, 下轮续(冻结<={window_end})")
     print(f"[fin] DONE stocks={n_stocks} rows_upserted={n_rows} err={n_err}"
-          f"{f' retry_queue={n_retry}' if normal else ''}", flush=True)
+          f"{f' retry_queue={n_retry}' if normal else ''}{tail}", flush=True)
     return n_stocks, n_err
 
 
@@ -615,12 +688,18 @@ def main():
                     help="本轮最多处理 N 只后优雅停 (需与 --fin-since 同用)")
     ap.add_argument("--fin-sleep", type=float, default=0.0,
                     help="fin 在内置防封节奏之上追加的逐股延时秒数(一般不需要)")
+    ap.add_argument("--fin-catchup", action="store_true",
+                    help="日更续跑: 仅当有未跑完的冻结窗口时才跑 fin, "
+                         "无欠账立即退出(零请求)。供每日 cron 消化中报季洪峰")
     ap.add_argument("--dry-run", action="store_true",
                     help="只抓不写库(事务最后回滚), 用于验证抓取完整性")
     args = ap.parse_args()
     if (args.fin_after or args.fin_limit) and not args.fin_since:
         ap.error("--fin-after/--fin-limit 仅限显式模式, 必须与 --fin-since 同用"
-                 " (正常模式游标语义不兼容断点/限量)")
+                 " (正常模式自己管断点/限量, 见 fin_resume_code / FIN_RUN_CAP)")
+    if args.fin_catchup and args.fin_since:
+        ap.error("--fin-catchup 是正常模式的日更续跑, 不能与 --fin-since 同用"
+                 " (显式模式不读不写窗口/断点)")
     sections = {s.strip() for s in args.sections.split(",") if s.strip()}
     ann_days = [d for d in args.ann_days.split(",") if d.strip()]
 
@@ -648,7 +727,8 @@ def main():
             n_stocks, n_err = update_fin_abstract(conn, since=args.fin_since or None,
                                                   sleep_s=args.fin_sleep,
                                                   after=args.fin_after,
-                                                  limit=args.fin_limit)
+                                                  limit=args.fin_limit,
+                                                  catchup_only=args.fin_catchup)
             stats.append(f"fin_stocks={n_stocks}(err={n_err})")
         except Exception as e:
             failed += 1
