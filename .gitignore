@@ -7,6 +7,8 @@ venv/
 # 运行时数据 —— 本仓库只提供程序, 不提供数据
 astock_data/
 backfill_data/
+minute_data/
+auction_data/
 *.parquet
 *.db
 *.log
