@@ -7,7 +7,7 @@ V4 生产版 — 全市场 valuation_daily 重建 (5321 只)
       1) cninfo_share_change_full.parquet (全市场新鲜版, 110K 行)
       2) dividend_history.parquet (除权日校正, 修 cninfo 标日偏差)
       3) baostock query_profit_data (季报 pubDate 兜底, cninfo 截止日之后)
-  - total_mv = close × total_share / 1e8 (亿元)
+  - total_mv = close × total_share (元)
 
 输出:
   - valuation_daily_baostock_v4.parquet (字段同 v3)
@@ -43,6 +43,8 @@ MAX_RETRY = 3
 CHUNK_SIZE = 30  # 每批 30 只, 流式收集
 
 def to_bs_code(code):
+    # 北交所/三板 (4/8/92 开头): baostock 不支持, 返回 None 由调用方跳过
+    if code.startswith(('4','8','92')): return None
     if code.startswith(('6','5','9')): return f'sh.{code}'
     return f'sz.{code}'
 
@@ -180,7 +182,8 @@ def compute_cap(daily, shares_tl):
     backfill = pd.DataFrame([{'date': pd.Timestamp('2000-01-01'), 'total_share': first_share}])
     s2 = pd.concat([backfill, s], ignore_index=True)
     merged = pd.merge_asof(d, s2, on='date', direction='backward')
-    merged['total_mv'] = merged['close'] * merged['total_share'] / 1e8
+    # total_mv 统一为"元", 与 Step3 增量路径一致 (曾为亿元, 会造成同列单位混用)
+    merged['total_mv'] = merged['close'] * merged['total_share']
     return merged
 
 def worker(args):
@@ -192,6 +195,9 @@ def worker(args):
     for code in chunk:
         t0 = time.time()
         bs_code = to_bs_code(code)
+        if bs_code is None:   # 北交所跳过
+            results.append((code, None, 'beijing/excluded'))
+            continue
         try:
             daily, err1 = fetch_daily(bs_code)
             if err1 or daily is None or len(daily) == 0:
@@ -299,7 +305,7 @@ def main():
             sub = pl_df.filter(pl.col('stock_code') == code)
             if len(sub) > 0:
                 tm = sub['total_mv'].drop_nulls()
-                LOG(f'  {code}: {len(sub)} 行, total_mv [{tm.min():.0f}, {tm.max():.0f}] 亿')
+                LOG(f'  {code}: {len(sub)} 行, total_mv [{tm.min()/1e8:.0f}, {tm.max()/1e8:.0f}] 亿元')
 
 if __name__ == '__main__':
     main()

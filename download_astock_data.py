@@ -40,23 +40,14 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
-# ============ 强制清除代理 ============
+# ============ 进程内清除代理 ============
+# 仅影响本进程, 不改动系统设置。
+# 注意: 曾用 winreg 把系统注册表 ProxyEnable 置 0(持久化), 已移除 —— 那会在用户不知情时
+# 永久关闭 Windows 系统代理。若确需绕过系统代理访问国内数据源, 在启动本脚本的外层环境设置即可。
 for var in ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']:
     os.environ[var] = ''
     if var in os.environ:
         del os.environ[var]
-
-# 清除 Windows 系统级代理 (注册表级别)
-if sys.platform == 'win32':
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                             r'Software\Microsoft\Windows\CurrentVersion\Internet Settings',
-                             0, winreg.KEY_SET_VALUE)
-        winreg.SetValueEx(key, 'ProxyEnable', 0, winreg.REG_DWORD, 0)
-        winreg.CloseKey(key)
-    except Exception:
-        pass
 
 import requests
 from requests.sessions import Session
@@ -99,10 +90,12 @@ MERGE_BATCH_SIZE = 200        # 合并时每批处理的文件数
 # ============ 工具函数 ============
 
 def code_to_tx_symbol(code):
-    """6位代码转腾讯格式: 000001→sz000001, 600519→sh600519"""
-    if code.startswith('6'):
-        return f'sh{code}'
-    else:  # 0xx, 3xx, 8xx, 4xx
+    """6位代码转腾讯格式: 000001→sz000001, 600519→sh600519, 920xxx→bj920xxx"""
+    if code.startswith(('6', '9')):      # 6xx 沪A / 9xx 沪B; 92x 是北交所
+        return f'bj{code}' if code.startswith('92') else f'sh{code}'
+    elif code.startswith(('4', '8')):    # 4xx/8xx 北交所/三板
+        return f'bj{code}'
+    else:                                # 0xx, 3xx 深A/创业板
         return f'sz{code}'
 
 
@@ -321,7 +314,12 @@ def step0_stock_list():
     df = df[~df['stock_name'].str.contains(r'ST|退', case=False, na=False)].reset_index(drop=True)
     # 去重 (方案3可能有重复)
     df = df.drop_duplicates(subset='stock_code').reset_index(drop=True)
-    print(f'  过滤ST/退市+去重: {before_filter} → {len(df)} 只')
+    # 显式剔除北交所/三板 (4/8/92 开头): 数据源列名/市场代码与主板不同, 直接跑会出错, README 声明不含
+    beijing_mask = df['stock_code'].str.startswith(('4', '8', '92'))
+    if beijing_mask.any():
+        print(f'  剔除北交所/三板: {int(beijing_mask.sum())} 只')
+        df = df[~beijing_mask].reset_index(drop=True)
+    print(f'  过滤ST/退市+去重+剔北交所: {before_filter} → {len(df)} 只')
 
     df.to_parquet(output_path, index=False, engine='pyarrow')
     print(f'  ✅ 保存 {len(df)} 只股票 → {output_path}')
@@ -397,6 +395,28 @@ def step2_daily_ohlcv(resume=False, incremental=False, limit=0):
     errors = load_errors()
     completed = get_completed_codes(progress, 'step2') if resume else set()
 
+    # qfq 前复权一致性: 前复权价格会随除权事件全历史重算, 增量"只追加"会让历史行保持旧复权基准。
+    # 因此: 用 dividend_history 的除权日检测每只股票是否出现"基准后"的新除权, 有则全量重拉该股。
+    if 'step2_qfq_basis' not in progress:
+        progress['step2_qfq_basis'] = {}
+    stored_basis = progress['step2_qfq_basis']   # code -> 该股已并入日线库的 max ex_dividend_date
+    qfq_basis = {}                                # code -> 当前 dividend_history 中 max ex_dividend_date
+    if incremental:
+        div_path = os.path.join(OUTPUT_DIR, 'dividend_history.parquet')
+        if os.path.exists(div_path):
+            try:
+                ddf = pd.read_parquet(div_path, columns=['stock_code', 'ex_dividend_date'])
+                ddf['ex_dividend_date'] = pd.to_datetime(ddf['ex_dividend_date'], errors='coerce')
+                ddf = ddf.dropna(subset=['ex_dividend_date'])
+                qfq_basis = ddf.groupby('stock_code')['ex_dividend_date'].max() \
+                    .apply(lambda x: x.strftime('%Y-%m-%d')).to_dict()
+                print(f'  前复权检测: 分红表含 {len(qfq_basis)} 只股票')
+            except Exception as e:
+                print(f'  ⚠ 读取分红记录失败, 前复权除权检测跳过: {e}')
+                qfq_basis = {}
+        else:
+            print(f'  ⚠ dividend_history.parquet 不存在, 前复权除权检测跳过 (建议先跑 Step 5)')
+
     if resume and completed:
         print(f'  断点续传: 已完成 {len(completed)}/{total}')
 
@@ -412,18 +432,29 @@ def step2_daily_ohlcv(resume=False, incremental=False, limit=0):
         print(f'  [{i+1}/{total}] ({pct:.1f}%) {code}', end='', flush=True)
 
         # 增量模式: 确定起始日期
+        last_date = None
         if incremental and code in incremental_start_dates:
             last_date = incremental_start_dates[code]
             fetch_start = (last_date + timedelta(days=1)).strftime('%Y%m%d')
-            # 如果最新日期就是今天，跳过
-            if fetch_start > END_DATE:
-                print(f' → 已是最新')
-                mark_completed(progress, 'step2', code)
-                skip_count += 1
-                success_count += 1
-                continue
         else:
             fetch_start = START_DATE
+
+        # qfq 除权检测: 若该股出现比"已并入日线库基准"更新的除权日 → 全量重拉, 保证前复权序列一致
+        need_refetch = False
+        if incremental and code in qfq_basis:
+            latest_ex = qfq_basis[code]
+            prev_basis = stored_basis.get(code)
+            if prev_basis is not None and prev_basis < latest_ex:
+                need_refetch = True
+        if need_refetch:
+            print(' → 检测到除权, 全量重拉(qfq) ', end='', flush=True)
+            fetch_start = START_DATE
+        elif incremental and last_date is not None and fetch_start > END_DATE:
+            print(f' → 已是最新')
+            mark_completed(progress, 'step2', code)
+            skip_count += 1
+            success_count += 1
+            continue
 
         ok = False
         tx_symbol = code_to_tx_symbol(code)
@@ -448,7 +479,10 @@ def step2_daily_ohlcv(resume=False, incremental=False, limit=0):
 
                     temp_path = os.path.join(temp_dir, f'{code}.parquet')
                     df.to_parquet(temp_path, index=False, engine='pyarrow')
-                    mode = '增量' if incremental and code in incremental_start_dates else '全量'
+                    if need_refetch:
+                        mode = '增量(qfq重拉)'
+                    else:
+                        mode = '增量' if incremental and code in incremental_start_dates else '全量'
                     print(f' → {len(df)}行({mode}) ✓')
                     ok = True
                     break
@@ -467,6 +501,8 @@ def step2_daily_ohlcv(resume=False, incremental=False, limit=0):
         if ok:
             success_count += 1
             mark_completed(progress, 'step2', code)
+            if incremental and code in qfq_basis:
+                stored_basis[code] = qfq_basis[code]   # 该股日线库已与此除权基准一致
         else:
             fail_count += 1
 
@@ -474,6 +510,10 @@ def step2_daily_ohlcv(resume=False, incremental=False, limit=0):
 
     # 分批合并
     merge_temp_files(temp_dir, output_path, sort_columns=['stock_code', 'date'])
+
+    if incremental:
+        progress['step2_qfq_basis'] = stored_basis
+        save_progress(progress)
 
     if incremental:
         print(f'  成功: {success_count}, 跳过(已最新): {skip_count}, 失败: {fail_count}')
@@ -613,6 +653,11 @@ def _step3_incremental(stock_list_path, output_path, limit=0):
             for attempt in range(MAX_RETRIES):
                 try:
                     bs_code = to_bs_code(code)
+                    if bs_code is None:   # 北交所 baostock 不支持
+                        print(' → 北交所跳过')
+                        skipped += 1
+                        ok = True
+                        break
 
                     # 1. 拉 daily (仅新增日期)
                     rs = bs.query_history_k_data_plus(
@@ -664,15 +709,14 @@ def _step3_incremental(stock_list_path, output_path, limit=0):
                     cninfo_sh_fixed = fix_cninfo_with_divhistory(cninfo_sh, div_ev) if len(cninfo_sh) > 0 else cninfo_sh
                     timeline = merge_share_timeline(cninfo_sh_fixed, bao_sh)
 
-                    # 4. 计算 total_mv (compute_cap 输出是亿元, 我们要元)
+                    # 4. 计算 total_mv (compute_cap 输出已统一为"元", 与 V4 全量一致)
                     merged = compute_cap(daily, timeline)
                     merged['stock_code'] = code
                     merged = merged.rename(columns={
                         'peTTM': 'pe_ttm', 'pbMRQ': 'pb',
                         'psTTM': 'ps_ttm', 'pcfNcfTTM': 'pcf_ttm',
                     })
-                    if 'total_mv' in merged.columns:
-                        merged['total_mv'] = merged['total_mv'] * 1e8  # 亿元 → 元
+                    # total_mv 由 compute_cap 输出, 单位统一为"元" (与 V4 全量一致)
 
                     out = merged[['stock_code', 'date', 'pe_ttm', 'pb', 'ps_ttm', 'pcf_ttm', 'total_share', 'total_mv']].copy()
                     if last_date is not None:

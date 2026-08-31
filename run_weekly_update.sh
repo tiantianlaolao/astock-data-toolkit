@@ -49,8 +49,10 @@ ls -lh $DATA_DIR/*.parquet 2>&1 >> $LOG
 
 # ---- 跑 step 1~5 增量 ----
 # 不跑 step 0 (股票列表), 每周变化很小, 偶尔手动跑即可
+# 顺序: 1(指数) → 5(分红) → 2(日线) → 3(估值) → 4(财务)
+#   分红必须先于日线/估值: Step2 靠它检测除权做前复权全量重拉, Step3 靠它做除权日对齐
 overall_failed=0
-for step in 1 2 3 4 5; do
+for step in 1 5 2 3 4; do
     echo "" >> $LOG
     echo "[$(date '+%H:%M:%S')] ===== Step $step (incremental) =====" >> $LOG
 
@@ -100,4 +102,5 @@ if [ -n "$POST_UPDATE_CMD" ]; then
     sleep 20
 fi
 
-exit $overall_failed
+# 退出码收敛为 0/1: 任何一步失败即 1, 全部成功即 0 (供 cron 判断)
+exit $(( overall_failed == 0 ? 0 : 1 ))

@@ -6,6 +6,7 @@
 输出: 脚本目录下 cninfo_share_change_full.parquet (可用环境变量 ASTOCK_HOME 覆盖目录)
 """
 import os, sys, io, time, threading
+from datetime import datetime
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
 def LOG(m): print(m, flush=True)
 
@@ -34,7 +35,12 @@ LOG(f'  样例: {codes[:5]} ... {codes[-5:]}')
 def fetch_one(code):
     for retry in range(3):
         try:
-            df = ak.stock_share_change_cninfo(symbol=code, start_date='20200101', end_date='20260501')
+            # end_date 动态化: 硬编码固定日期会让 2026-05 之后的股本变动永远抓不到
+            df = ak.stock_share_change_cninfo(
+                symbol=code,
+                start_date='20200101',
+                end_date=datetime.now().strftime('%Y%m%d'),
+            )
             if df is None or len(df) == 0:
                 return code, None, 'empty'
             df = df[['证券代码', '变动日期', '变动原因', '总股本']].copy()
