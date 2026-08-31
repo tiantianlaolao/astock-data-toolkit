@@ -4,4 +4,5 @@ pytdx>=1.72          # 分钟线：直连通达信行情服务器，无需安装
 pandas>=2.0.0
 numpy
 pyarrow
+polars            # Step 3 估值增量 / V4 重建写 parquet(zstd) 必需
 requests
